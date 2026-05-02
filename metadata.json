@@ -1,0 +1,6 @@
+{
+  "name": "Chinese Audio Transcriber",
+  "description": "Upload Chinese movie audio and generate timestamped transcriptions with SRT download.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
