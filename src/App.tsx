@@ -6,6 +6,11 @@ interface TranscriptSegment {
   endTime: string;
   startMs: number;
   endMs: number;
+  localStartMs?: number;
+  localEndMs?: number;
+  queueIndex?: number;
+  rawStartMs?: number;
+  rawEndMs?: number;
   speaker?: string;
   text: string;
   khmerText: string;
@@ -30,14 +35,59 @@ function formatSrtTime(totalSeconds: number): string {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
 }
 
+function getRetryDelayMs(errorMessage: string) {
+  const match = errorMessage.match(/retry in\s+([\d.]+)s/i);
+  if (match) return Math.ceil(parseFloat(match[1]) * 1000) + 2000;
+  return 60000;
+}
+
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function sanitizePartCues(rawCues: any[], file: any) {
+  if (!file || typeof file.durationMs !== 'number') return rawCues;
+  const maxMs = file.durationMs + 10000;
+
+  return rawCues
+    .filter(cue => cue.startMs >= 0 && cue.startMs <= maxMs)
+    .map(cue => ({
+      ...cue,
+      startMs: Math.min(cue.startMs, file.durationMs),
+      endMs: Math.min(cue.endMs, file.durationMs),
+    }))
+    .filter(cue => cue.endMs > cue.startMs);
+}
+
 function addSrtTimeOffset(srtTime: string, offsetSec: number): string {
   const currentSec = parseSrtTime(srtTime);
   return formatSrtTime(currentSec + offsetSec);
 }
 
+function detectErrorCode(message: string): string {
+  const msg = message.toLowerCase();
+  if (msg.includes("429") || msg.includes("quota") || msg.includes("rate limit")) return "rate_limit";
+  if (msg.includes("payload too large") || msg.includes("413")) return "file_too_large";
+  if (msg.includes("network error") || msg.includes("fetch failed") || msg.includes("timeout")) return "network_error";
+  if (msg.includes("safety")) return "safety_block";
+  if (msg.includes("json")) return "parse_error";
+  return "unknown_error";
+}
+
 export default function App() {
   const [files, setFiles] = useState<File[]>([]);
-  const [queueState, setQueueState] = useState<{fileName: string, status: 'pending' | 'done' | 'failed' | 'transcribing', size: number, durationMs?: number, queueIndex: number}[]>([]);
+  const [queueState, setQueueState] = useState<{
+    fileName: string, 
+    status: 'pending' | 'done' | 'failed' | 'transcribing' | 'MissingFile', 
+    size: number, 
+    durationMs?: number, 
+    queueIndex: number,
+    errorMessage?: string,
+    errorCode?: string,
+    failedAt?: string,
+    retryCount?: number,
+    fileObject?: File
+  }[]>([]);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
 
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -86,7 +136,8 @@ export default function App() {
 
   useEffect(() => {
     if (isProjectLoaded) {
-       localStorage.setItem('shengyin-project-v2', JSON.stringify({ transcripts, queueState }));
+       const queueToSave = queueState.map(({fileObject, ...rest}) => rest);
+       localStorage.setItem('shengyin-project-v2', JSON.stringify({ transcripts, queueState: queueToSave }));
     }
   }, [transcripts, queueState, isProjectLoaded]);
 
@@ -171,13 +222,18 @@ export default function App() {
        const maxIndex = merged.length > 0 ? Math.max(...merged.map(q => q.queueIndex)) : -1;
        
        filesWithDuration.forEach(({file, durationMs}, i) => {
-          if (!merged.find(q => q.fileName === file.name)) {
+          const existing = merged.find(q => q.fileName === file.name && q.size === file.size);
+          if (existing) {
+             existing.fileObject = file;
+             existing.status = existing.status === 'MissingFile' ? 'pending' : existing.status;
+          } else {
              merged.push({ 
                  fileName: file.name, 
                  status: 'pending', 
                  size: file.size, 
                  durationMs, 
-                 queueIndex: maxIndex + 1 + i 
+                 queueIndex: maxIndex + 1 + i,
+                 fileObject: file
              });
           }
        });
@@ -234,24 +290,47 @@ export default function App() {
   };
 
   const normalizeCue = (cue: any, queueItem: any, queue: any[]) => {
-    const offsetMs = getOffsetMs(queueItem, queue);
     const rawStartMs = cue.rawStartMs ?? (parseSrtTime(cue.startTime) * 1000);
     const rawEndMs = cue.rawEndMs ?? (parseSrtTime(cue.endTime) * 1000);
-    const startMs = rawStartMs + offsetMs;
-    const endMs = rawEndMs + offsetMs;
-    console.log(`normalizeCue: file=${queueItem.fileName}, rawStartMs=${rawStartMs}, offsetMs=${offsetMs}, startMs=${startMs}`);
+    
+    const localStartMs = Math.max(0, Math.min(rawStartMs, queueItem.durationMs || 0));
+    const localEndMs = Math.max(localStartMs, Math.min(rawEndMs, queueItem.durationMs || 0));
+    
+    const offsetMs = getOffsetMs(queueItem, queue);
+    const startMs = offsetMs + localStartMs;
+    const endMs = offsetMs + localEndMs;
+    
     return {
       ...cue,
       fileId: queueItem.fileName,
       partName: queueItem.fileName,
+      queueIndex: queueItem.queueIndex,
       rawStartMs,
       rawEndMs,
+      localStartMs,
+      localEndMs,
+      offsetMs,
       startMs,
       endMs,
       startTime: formatSrtTime(startMs / 1000),
       endTime: formatSrtTime(endMs / 1000),
-      offsetMs,
     };
+  };
+
+  const updateFileStatus = (fileName: string, status: 'done' | 'failed', error?: any) => {
+    setQueueState(prev => prev.map(q => {
+      if (q.fileName === fileName) {
+        return {
+          ...q,
+          status,
+          errorMessage: status === 'failed' ? (error?.message || String(error)) : undefined,
+          errorCode: status === 'failed' ? detectErrorCode(error?.message || String(error)) : undefined,
+          failedAt: status === 'failed' ? new Date().toISOString() : undefined,
+          retryCount: status === 'failed' ? ((q.retryCount || 0) + 1) : q.retryCount
+        };
+      }
+      return q;
+    }));
   };
 
   const startTranscription = async (retryFailed: boolean = false) => {
@@ -264,14 +343,18 @@ export default function App() {
 
     if (itemsToProcess.length === 0) return;
 
-    const missingFiles = itemsToProcess.filter(q => !files.find(f => f.name === q.fileName));
+    const missingFiles = itemsToProcess.filter(q => !q.fileObject);
     if (missingFiles.length > 0) {
-       setError(`Missing files in memory for: ${missingFiles.map(m=>m.fileName).join(', ')}. Please use 'Add parts' to select them again before resuming.`);
+       for (const mf of missingFiles) {
+          updateFileStatus(mf.fileName, 'failed', new Error("File missing. Please upload/rebind file."));
+          console.log("Missing file object", mf.fileName);
+       }
+       setError(`Missing files in memory for: ${missingFiles.map(m=>m.fileName).join(', ')}. Please use 'Add parts' to re-select them.`);
        return;
     }
 
-    if (itemsToProcess.some(f => f.size > 20 * 1024 * 1024)) {
-       setError("One or more files exceed 20MB. Please follow the instructions to split or compress large files using FFmpeg on your computer before uploading.");
+    if (itemsToProcess.some(f => f.fileObject && f.size > 20 * 1024 * 1024)) {
+       setError("One or more files exceed 20MB...");
        return;
     }
 
@@ -293,8 +376,9 @@ export default function App() {
         if (currentQueueItem.status === 'done') continue;
         if (!retryFailed && currentQueueItem.status === 'failed') continue;
 
-        const currentFile = files.find(f => f.name === currentQueueItem.fileName);
+        const currentFile = currentQueueItem.fileObject;
         if (!currentFile) {
+            updateFileStatus(currentQueueItem.fileName, 'failed', new Error("File missing."));
             setError(`Missing file ${currentQueueItem.fileName} during run!`);
             break; 
         }
@@ -310,7 +394,7 @@ export default function App() {
                     setTranscripts(prev => [
                         ...prev.filter(cue => cue.fileId !== currentQueueItem.fileName),
                         ...adjustedChunk
-                    ].sort((a, b) => a.startMs - b.startMs));
+                    ].sort((a, b) => (a.queueIndex || 0) - (b.queueIndex || 0) || (a.localStartMs || 0) - (b.localStartMs || 0)));
                     
                     setQueueState(prev => prev.map(q => q.fileName === currentQueueItem.fileName ? { ...q, status: 'done' } : q));
                     setUploadProgress(Math.round(((i + 1) / queueState.length) * 100));
@@ -335,6 +419,7 @@ export default function App() {
         let success = false;
         let retryCount = 0;
         let parsedChunk: TranscriptSegment[] = [];
+        let lastError = null;
 
         while (!success && retryCount < 3) {
             if (stopRequestedRef.current) return;
@@ -363,7 +448,7 @@ export default function App() {
                 (previousContext ? `\n\nFor context and to maintain speaker continuity, the previous spoken lines from the preceding audio part were:\n${previousContext}\n\nPlease continue the transcription using the same speaker labels where applicable.` : '');
 
                 const response = await ai.models.generateContent({
-                  model: fastMode ? "gemini-3.1-flash" : "gemini-3.1-pro-preview",
+                  model: "gemini-flash-latest",
                   contents: [
                     {
                       inlineData: {
@@ -411,20 +496,18 @@ export default function App() {
                 }
                 
                 localStorage.setItem(cacheKey, JSON.stringify(parsedChunk));
-                setQueueState(prev => prev.map(q => q.fileName === currentQueueItem.fileName ? { ...q, status: 'done' } : q));
+                setQueueState(prev => prev.map(q => q.fileName === currentQueueItem.fileName ? { ...q, status: 'done', errorMessage: undefined, errorCode: undefined, failedAt: undefined } : q));
                 success = true;
             } catch (err: any) {
-                const msg = err.message ? err.message.toLowerCase() : String(err).toLowerCase();
-                if (msg.includes("429") || msg.includes("quota") || msg.includes("rate limit")) {
+                lastError = err;
+                const msg = String(err?.message || err).toLowerCase();
+                const isRateLimit = msg.includes("resource_exhausted") || msg.includes("429") || msg.includes("quota") || msg.includes("rate limit");
+                
+                if (isRateLimit && retryCount < 2) {
                     retryCount++;
-                    if (retryCount >= 3) break;
-                    setTranscriptionProgressMessage(`Rate limited. Waiting 60s before retry ${retryCount}/3...`);
-                    for(let c = 60; c > 0; c--) {
-                        if (stopRequestedRef.current) return;
-                        setCountdown(c);
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-                    setCountdown(0);
+                    const delayMs = getRetryDelayMs(msg);
+                    setTranscriptionProgressMessage(`Rate limited. Waiting ${Math.ceil(delayMs / 1000)}s before retry ${retryCount}/3...`);
+                    await sleep(delayMs);
                 } else {
                     console.error("API error during part transcribing:", err);
                     break;
@@ -433,15 +516,28 @@ export default function App() {
         }
 
         if (success) {
-            const adjustedChunk = parsedChunk.map(seg => normalizeCue(seg, currentQueueItem, queueState));
+            const rawCues = parsedChunk.map((cue: any) => ({
+                 ...cue,
+                 startMs: parseSrtTime(cue.startTime) * 1000,
+                 endMs: parseSrtTime(cue.endTime) * 1000
+            }));
+            const localCues = sanitizePartCues(rawCues, currentQueueItem);
+            
+            const rejectedCount = parsedChunk.length - localCues.length;
+            if (parsedChunk.length > 0 && rejectedCount / parsedChunk.length > 0.2) {
+               console.warn(`Part ${i+1} rejected ${rejectedCount} cues out of ${parsedChunk.length}. Marking failed.`);
+               updateFileStatus(currentQueueItem.fileName, 'failed', new Error("Bad timestamps from Gemini, retry this part."));
+            } else {
+               const adjustedChunk = localCues.map(seg => normalizeCue(seg, currentQueueItem, queueState));
 
-            setTranscripts(prev => [
-                ...prev.filter(cue => cue.fileId !== currentQueueItem.fileName),
-                ...adjustedChunk
-            ].sort((a, b) => a.startMs - b.startMs));
+               setTranscripts(prev => [
+                   ...prev.filter(cue => cue.fileId !== currentQueueItem.fileName),
+                   ...adjustedChunk
+               ].sort((a, b) => (a.queueIndex || 0) - (b.queueIndex || 0) || (a.localStartMs || 0) - (b.localStartMs || 0)));
+            }
         } else {
             console.warn(`Part ${i+1} failed after retries.`);
-            setQueueState(prev => prev.map(q => q.fileName === currentQueueItem.fileName ? { ...q, status: 'failed' } : q));
+            updateFileStatus(currentQueueItem.fileName, 'failed', lastError);
         }
       }
 
@@ -521,7 +617,7 @@ export default function App() {
       const prompt = `Transcribe the following Chinese audio. Output the transcription as a JSON array of objects, with each object containing 'startTime' (string, e.g., '00:00:01,000' using exact SRT time format of HH:MM:SS,mmm), 'endTime' (string, also HH:MM:SS,mmm format), 'speaker' (string, identify the speaker, e.g. 'Speaker 1', 'Speaker 2'), 'text' (Chinese text spoken), and 'khmerText' (Accurate, natural-sounding Khmer translation of the Chinese text). Respond ONLY with valid JSON.\n\nCRITICAL INSTRUCTION: The transcription previously stopped at ${lastSeg.endTime}. You MUST completely IGNORE all audio before ${lastSeg.endTime}. Start transcribing EXACTLY from timestamp ${lastSeg.endTime} and continue until the end of the file. Output timestamps accurately reflecting the actual time in the audio file.\n\nFor context and to maintain speaker continuity, the previous spoken lines before ${lastSeg.endTime} were:\n${previousContext}\n\nPlease continue the transcription using the same speaker labels where applicable.`;
 
       const response = await ai.models.generateContent({
-        model: fastMode ? "gemini-3.1-flash" : "gemini-3.1-pro-preview",
+        model: "gemini-flash-latest",
         contents: [
           {
             inlineData: {
@@ -569,21 +665,19 @@ export default function App() {
         }
       }
 
-      const allTranscripts = [...transcripts, ...parsedChunk.map(seg => {
-        const offsetSec = getPreviousPartsOffsetSec(files[0].name);
-        const startSec = parseSrtTime(seg.startTime);
-        const endSec = parseSrtTime(seg.endTime);
-        const newStartSec = startSec + offsetSec;
-        const newEndSec = endSec + offsetSec;
-        console.log("handleContinueTranscription offset:", offsetSec, "raw:", seg.startTime, "new:", formatSrtTime(newStartSec));
-        return {
-          ...seg,
-          startTime: formatSrtTime(newStartSec),
-          endTime: formatSrtTime(newEndSec),
-          startMs: newStartSec * 1000,
-          endMs: newEndSec * 1000
-        };
-      })];
+      const currentFileObj = files[0];
+      const currentQueueItemObj = queueState.find(q => q.fileName === currentFileObj?.name);
+
+      const rawCues = parsedChunk.map((cue: any) => ({
+           ...cue,
+           startMs: parseSrtTime(cue.startTime) * 1000,
+           endMs: parseSrtTime(cue.endTime) * 1000
+      }));
+      const localCues = sanitizePartCues(rawCues, currentQueueItemObj);
+
+      const allTranscripts = [...transcripts, ...localCues.map(seg => normalizeCue(seg, currentQueueItemObj, queueState))]
+         .sort((a, b) => (a.queueIndex || 0) - (b.queueIndex || 0) || (a.localStartMs || 0) - (b.localStartMs || 0));
+      
       setTranscripts(allTranscripts);
 
       if (audioRef.current && audioRef.current.duration > 0 && allTranscripts.length > 0) {
@@ -634,9 +728,14 @@ export default function App() {
   const downloadSrt = (lang: 'zh' | 'km') => {
     if (transcripts.length === 0) return;
 
+    const totalProjectDurationMs = queueState.reduce((sum, q) => sum + (q.durationMs || 0), 0);
+    const maxExportMs = totalProjectDurationMs + 10000;
+
+    const exportFilteredTranscripts = transcripts.filter(seg => seg.startMs <= maxExportMs);
+
     const filteredTranscripts = exportSpeaker === 'All'
-      ? transcripts
-      : transcripts.filter(seg => seg.speaker === exportSpeaker);
+      ? exportFilteredTranscripts
+      : exportFilteredTranscripts.filter(seg => seg.speaker === exportSpeaker);
 
     const srtContent = filteredTranscripts
       .map((seg, i) => {
@@ -781,14 +880,25 @@ export default function App() {
                                  <span className="text-[10px] text-white/40">{(qItem.size / (1024 * 1024)).toFixed(2)} MB</span>
                                  {qItem.status === 'done' && <span className="text-[10px] text-green-400 font-medium">Done</span>}
                                  {qItem.status === 'failed' && <span className="text-[10px] text-red-400 font-medium">Failed</span>}
-                                 {qItem.status === 'pending' && <span className="text-[10px] text-white/40">Pending</span>}
-                                 {qItem.status === 'transcribing' && <span className="text-[10px] text-indigo-400 font-medium">Transcribing...</span>}
+                                 {qItem.status === 'MissingFile' && <span className="text-[10px] text-orange-400 font-medium">Missing File</span>}
+                                 {(qItem.status === 'pending' || qItem.status === 'transcribing') && <span className="text-[10px] text-indigo-400 font-medium">{isUploading && (files.length > 0 && files[0].name === qItem.fileName) ? 'Transcribing...' : (qItem.status === 'transcribing' ? 'Transcribing...' : 'Pending')}</span>}
                               </div>
+                              {qItem.status === 'failed' && qItem.errorMessage && (
+                                <div className="text-[10px] text-red-400 mt-1 truncate" title={qItem.errorMessage}>Failed: {qItem.errorMessage}</div>
+                              )}
+                              {qItem.status === 'MissingFile' && (
+                                <div className="text-[10px] text-orange-400 mt-1 truncate">Please re-upload this file</div>
+                              )}
                             </div>
                             
                             <div className="flex items-center gap-1">
                                 {qItem.status === 'failed' && (
-                                    <button onClick={() => startTranscription(true)} className="p-1.5 text-orange-400 hover:bg-orange-500/10 rounded-lg">Retry</button>
+                                    <>
+                                        <button onClick={() => navigator.clipboard.writeText(qItem.errorMessage || "No error details")} className="p-1.5 text-white/30 hover:text-white/80 rounded-lg">
+                                            <Copy className="w-3 h-3" />
+                                        </button>
+                                        <button onClick={() => startTranscription(true)} className="p-1.5 text-orange-400 hover:bg-orange-500/10 rounded-lg">Retry</button>
+                                    </>
                                 )}
                                 {!isUploading && (
                                   <button
