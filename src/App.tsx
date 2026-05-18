@@ -427,8 +427,11 @@ export default function App() {
             setUploadProgress(Math.round(((i) / queueState.length) * 100));
 
             try {
-                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name})${retryCount > 0 ? ` [Retry ${retryCount}/3]` : ''}...`);
+                console.log("START FILE", currentFile.name);
+                console.log("HAS FILE OBJECT", !!currentFile);
                 
+                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name}) - 5% Reading file${retryCount > 0 ? ` [Retry ${retryCount}/3]` : ''}...`);
+                console.log("READING ARRAY BUFFER");
                 const arrayBuffer = await currentFile.arrayBuffer();
                 let binary = '';
                 const bytes = new Uint8Array(arrayBuffer);
@@ -447,7 +450,9 @@ export default function App() {
                 const prompt = `Transcribe the following Chinese audio. Output the transcription as a JSON array of objects, with each object containing 'startTime' (string, e.g., '00:00:01,000' using exact SRT time format of HH:MM:SS,mmm), 'endTime' (string, also HH:MM:SS,mmm format), 'speaker' (string, identify the speaker, e.g. 'Speaker 1', 'Speaker 2'), 'text' (Chinese text spoken), and 'khmerText' (Accurate, natural-sounding Khmer translation of the Chinese text). Respond ONLY with valid JSON.\n\nCRITICAL: You are transcribing audio segment "${currentFile.name}". Timestamps MUST be relative to the start of THIS SPECIFIC audio file segment (00:00:00 to ${Math.floor((currentQueueItem.durationMs || 0) / 1000 / 60) + 1}:00). DO NOT include offsets of previous audio parts in your timestamps.` + 
                 (previousContext ? `\n\nFor context and to maintain speaker continuity, the previous spoken lines from the preceding audio part were:\n${previousContext}\n\nPlease continue the transcription using the same speaker labels where applicable.` : '');
 
-                const response = await ai.models.generateContent({
+                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name}) - 15% Uploading to Gemini...`);
+                console.log("CALLING GEMINI");
+                const requestPromise = ai.models.generateContent({
                   model: "gemini-flash-latest",
                   contents: [
                     {
@@ -477,7 +482,13 @@ export default function App() {
                     systemInstruction: "You are an expert bilingual transcription and translation assistant. Produce highly accurate transcription and culturally natural, grammatically correct Khmer translations. Ensure cultural nuances are preserved in the Khmer text. Follow JSON schema exactly and strictly output an array."
                   }
                 });
+                
+                const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Gemini request timeout")), 180000));
+                const response = await Promise.race([requestPromise, timeoutPromise]) as any;
+                console.log("GEMINI RESPONSE RECEIVED");
 
+                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name}) - 70% Parsing response...`);
+                console.log("PARSING CUES");
                 let jsonText = response.text || "[]";
                 try {
                   jsonText = jsonText.replace(/^```json\n?/, '').replace(/\n?```$/, '');
@@ -495,9 +506,35 @@ export default function App() {
                   }
                 }
                 
+                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name}) - 85% Normalizing timestamps...`);
+                console.log("NORMALIZING CUES");
+                
+                const rawCues = parsedChunk.map((cue: any) => ({
+                     ...cue,
+                     startMs: parseSrtTime(cue.startTime) * 1000,
+                     endMs: parseSrtTime(cue.endTime) * 1000
+                }));
+                const localCues = sanitizePartCues(rawCues, currentQueueItem);
+                
+                const rejectedCount = parsedChunk.length - localCues.length;
+                if (parsedChunk.length > 0 && localCues.length === 0) {
+                     throw new Error("All cues rejected by timestamp validation. Check raw Gemini timestamps.");
+                } else if (parsedChunk.length > 0 && rejectedCount / parsedChunk.length > 0.2) {
+                     throw new Error("Bad timestamps from Gemini, retry this part.");
+                }
+
+                console.log("SAVING CUES");
+                const adjustedChunk = localCues.map(seg => normalizeCue(seg, currentQueueItem, queueState));
+
+                setTranscripts(prev => [
+                    ...prev.filter(cue => cue.fileId !== currentQueueItem.fileName),
+                    ...adjustedChunk
+                ].sort((a, b) => (a.queueIndex || 0) - (b.queueIndex || 0) || (a.localStartMs || 0) - (b.localStartMs || 0)));
+
                 localStorage.setItem(cacheKey, JSON.stringify(parsedChunk));
                 setQueueState(prev => prev.map(q => q.fileName === currentQueueItem.fileName ? { ...q, status: 'done', errorMessage: undefined, errorCode: undefined, failedAt: undefined } : q));
                 success = true;
+                setTranscriptionProgressMessage(`Transcribing part ${i + 1} of ${queueState.length} (${currentFile.name}) - 100% Done...`);
             } catch (err: any) {
                 lastError = err;
                 const msg = String(err?.message || err).toLowerCase();
@@ -515,27 +552,7 @@ export default function App() {
             }
         }
 
-        if (success) {
-            const rawCues = parsedChunk.map((cue: any) => ({
-                 ...cue,
-                 startMs: parseSrtTime(cue.startTime) * 1000,
-                 endMs: parseSrtTime(cue.endTime) * 1000
-            }));
-            const localCues = sanitizePartCues(rawCues, currentQueueItem);
-            
-            const rejectedCount = parsedChunk.length - localCues.length;
-            if (parsedChunk.length > 0 && rejectedCount / parsedChunk.length > 0.2) {
-               console.warn(`Part ${i+1} rejected ${rejectedCount} cues out of ${parsedChunk.length}. Marking failed.`);
-               updateFileStatus(currentQueueItem.fileName, 'failed', new Error("Bad timestamps from Gemini, retry this part."));
-            } else {
-               const adjustedChunk = localCues.map(seg => normalizeCue(seg, currentQueueItem, queueState));
-
-               setTranscripts(prev => [
-                   ...prev.filter(cue => cue.fileId !== currentQueueItem.fileName),
-                   ...adjustedChunk
-               ].sort((a, b) => (a.queueIndex || 0) - (b.queueIndex || 0) || (a.localStartMs || 0) - (b.localStartMs || 0)));
-            }
-        } else {
+        if (!success) {
             console.warn(`Part ${i+1} failed after retries.`);
             updateFileStatus(currentQueueItem.fileName, 'failed', lastError);
         }
